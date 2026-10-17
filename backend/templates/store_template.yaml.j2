@@ -1,0 +1,309 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ namespace }}
+  labels:
+    app.kubernetes.io/managed-by: wooforge
+    wooforge.io/store-id: "{{ store_id }}"
+    wooforge.io/store-slug: "{{ slug }}"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ namespace }}-quota
+  namespace: {{ namespace }}
+spec:
+  hard:
+    requests.cpu: "{{ cpu_cores }}"
+    requests.memory: "{{ memory_mb }}Mi"
+    limits.cpu: "{{ (cpu_cores * 2) | round(1) }}"
+    limits.memory: "{{ (memory_mb * 2) }}Mi"
+    persistentvolumeclaims: "4"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ namespace }}-secrets
+  namespace: {{ namespace }}
+type: Opaque
+stringData:
+  MYSQL_ROOT_PASSWORD: "{{ db_password }}"
+  MYSQL_DATABASE: "wordpress"
+  MYSQL_USER: "wordpress"
+  MYSQL_PASSWORD: "{{ db_password }}"
+  WORDPRESS_DB_PASSWORD: "{{ db_password }}"
+  WORDPRESS_ADMIN_PASSWORD: "{{ admin_password }}"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ namespace }}-init-script
+  namespace: {{ namespace }}
+data:
+  init-store.sh: |
+    #!/bin/sh
+    set -e
+    echo "[WooForge] Checking store initialization status..."
+    
+    if [ -f "/var/www/html/.wooforge_installed" ]; then
+      echo "[WooForge] Store is already initialized. Skipping WP-CLI bootstrap."
+      exit 0
+    fi
+
+    echo "[WooForge] Downloading WordPress core..."
+    wp core download --path=/var/www/html --allow-root --skip-content || true
+
+    echo "[WooForge] Waiting for Database service at mysql:3306..."
+    until wp config create \
+      --path=/var/www/html \
+      --dbname=wordpress \
+      --dbuser=wordpress \
+      --dbpass="$WORDPRESS_DB_PASSWORD" \
+      --dbhost=mysql:3306 \
+      --allow-root \
+      --force && wp db check --path=/var/www/html --allow-root; do
+      echo "[WooForge] Database not ready yet, retrying in 3 seconds..."
+      sleep 3
+    done
+
+    echo "[WooForge] Installing WordPress Core..."
+    wp core install \
+      --path=/var/www/html \
+      --url="http://{{ domain }}" \
+      --title="{{ name }}" \
+      --admin_user="{{ admin_username }}" \
+      --admin_password="$WORDPRESS_ADMIN_PASSWORD" \
+      --admin_email="{{ admin_email }}" \
+      --skip-email \
+      --allow-root
+
+    echo "[WooForge] Installing Storefront Theme..."
+    wp theme install storefront --activate --path=/var/www/html --allow-root || true
+
+    echo "[WooForge] Installing & Activating WooCommerce plugin..."
+    wp plugin install woocommerce --activate --path=/var/www/html --allow-root
+
+    echo "[WooForge] Configuring WooCommerce defaults..."
+    wp option update woocommerce_store_address "100 Cloud Native Way" --path=/var/www/html --allow-root
+    wp option update woocommerce_store_city "San Francisco" --path=/var/www/html --allow-root
+    wp option update woocommerce_default_country "US:CA" --path=/var/www/html --allow-root
+    wp option update woocommerce_currency "USD" --path=/var/www/html --allow-root
+
+    echo "[WooForge] Populating Catalog Preset: {{ catalog_preset }}..."
+    cd /var/www/html
+    {{ catalog_cli_script | indent(4) }}
+
+    echo "[WooForge] Fixing file permissions for Apache..."
+    chown -R 33:33 /var/www/html || true
+
+    touch /var/www/html/.wooforge_installed
+    echo "[WooForge] Store provisioning completed successfully!"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-data-pvc
+  namespace: {{ namespace }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ storage_gb }}Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wp-data-pvc
+  namespace: {{ namespace }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ storage_gb }}Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: {{ namespace }}
+  labels:
+    app: mysql
+    store: {{ slug }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+        store: {{ slug }}
+    spec:
+      containers:
+      - name: mysql
+        image: mariadb:10.11
+        imagePullPolicy: IfNotPresent
+        envFrom:
+        - secretRef:
+            name: {{ namespace }}-secrets
+        ports:
+        - containerPort: 3306
+          name: mysql
+        volumeMounts:
+        - name: mysql-persistent-storage
+          mountPath: /var/lib/mysql
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        readinessProbe:
+          tcpSocket:
+            port: 3306
+          initialDelaySeconds: 5
+          periodSeconds: 3
+      volumes:
+      - name: mysql-persistent-storage
+        persistentVolumeClaim:
+          claimName: mysql-data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: {{ namespace }}
+  labels:
+    app: mysql
+spec:
+  ports:
+  - port: 3306
+    targetPort: 3306
+  selector:
+    app: mysql
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordpress
+  namespace: {{ namespace }}
+  labels:
+    app: wordpress
+    store: {{ slug }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wordpress
+  template:
+    metadata:
+      labels:
+        app: wordpress
+        store: {{ slug }}
+    spec:
+      initContainers:
+      - name: wp-cli-init
+        image: wordpress:cli
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "/scripts/init-store.sh"]
+        securityContext:
+          runAsUser: 0
+        envFrom:
+        - secretRef:
+            name: {{ namespace }}-secrets
+        volumeMounts:
+        - name: wp-persistent-storage
+          mountPath: /var/www/html
+        - name: init-script-vol
+          mountPath: /scripts
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+      containers:
+      - name: wordpress
+        image: wordpress:6.5-apache
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: WORDPRESS_DB_HOST
+          value: mysql:3306
+        - name: WORDPRESS_DB_NAME
+          value: wordpress
+        - name: WORDPRESS_DB_USER
+          value: wordpress
+        - name: WORDPRESS_DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ namespace }}-secrets
+              key: WORDPRESS_DB_PASSWORD
+        ports:
+        - containerPort: 80
+          name: http
+        volumeMounts:
+        - name: wp-persistent-storage
+          mountPath: /var/www/html
+        resources:
+          requests:
+            cpu: 150m
+            memory: 256Mi
+          limits:
+            cpu: "{{ cpu_cores }}"
+            memory: "{{ memory_mb }}Mi"
+        readinessProbe:
+          httpGet:
+            path: /wp-login.php
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: wp-persistent-storage
+        persistentVolumeClaim:
+          claimName: wp-data-pvc
+      - name: init-script-vol
+        configMap:
+          name: {{ namespace }}-init-script
+          defaultMode: 0777
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wordpress
+  namespace: {{ namespace }}
+  labels:
+    app: wordpress
+spec:
+  ports:
+  - port: 80
+    targetPort: 80
+    name: http
+  selector:
+    app: wordpress
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: wordpress-ingress
+  namespace: {{ namespace }}
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+spec:
+  ingressClassName: {{ ingress_class }}
+  rules:
+  - host: "{{ domain }}"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: wordpress
+            port:
+              number: 80
