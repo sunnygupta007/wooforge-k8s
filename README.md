@@ -319,34 +319,6 @@ OK
 
 ---
 
-## 🚀 Pushing to GitHub
-
-To upload this project to your GitHub account:
-
-1. **Recommended Repository Name**: `wooforge-k8s` (or `kube-woo-provisioner`)
-2. Create a new empty repository on [GitHub](https://github.com/new).
-3. From your project root directory, run:
-
-```bash
-# Initialize git if not already initialized
-git init
-
-# Add all files
-git add .
-
-# Commit changes
-git commit -m "Initial commit: Production on-demand WooCommerce K8s provisioning system"
-
-# Rename default branch to main
-git branch -M main
-
-# Link to your GitHub remote
-git remote add origin https://github.com/<YOUR-USERNAME>/wooforge-k8s.git
-
-# Push code to GitHub
-git push -u origin main
-```
-
 ---
 
 ## 📄 License
